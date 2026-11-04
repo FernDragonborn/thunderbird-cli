@@ -19,6 +19,8 @@
  *   TB_BRIDGE_ALLOWED_HOSTS   extra comma-separated Host header names to accept, in addition to
  *                             IP literals, localhost, *.localhost and *.internal
  *   TB_BRIDGE_WS_HEARTBEAT_MS WebSocket ping interval used to drop dead extension sockets (default: 30000)
+ *   TB_BRIDGE_MAX_TIMEOUT     ceiling for the X-TB-Timeout override in ms (default: 600000)
+ *   TB_BRIDGE_MAX_BODY        max HTTP request body in bytes (default: 10485760)
  *
  * Per-request override: HTTP clients can pass `X-TB-Timeout: <ms>` header.
  */
@@ -32,6 +34,8 @@ const HTTP_PORT = parseInt(process.argv.find((_, i, a) => a[i - 1] === "--port")
 const WS_PORT = parseInt(process.argv.find((_, i, a) => a[i - 1] === "--ws-port") || "7701");
 const DEFAULT_TIMEOUT = parseInt(process.env.TB_BRIDGE_TIMEOUT || "120000");
 const HEARTBEAT_INTERVAL_MS = parseInt(process.env.TB_BRIDGE_WS_HEARTBEAT_MS || "30000");
+const MAX_TIMEOUT = parseInt(process.env.TB_BRIDGE_MAX_TIMEOUT || "600000");
+const MAX_BODY_BYTES = parseInt(process.env.TB_BRIDGE_MAX_BODY || String(10 * 1024 * 1024));
 const CORS_ALLOWED_ORIGINS = new Set(
   (process.env.TB_BRIDGE_CORS_ORIGINS || `http://127.0.0.1:${HTTP_PORT},http://localhost:${HTTP_PORT}`)
     .split(",")
@@ -115,21 +119,49 @@ function isWebPageOrigin(originHeader) {
 let extensionSocket = null;
 const pending = new Map(); // id → { resolve, reject, timer }
 
+function slotHeld() {
+  return extensionSocket !== null && extensionSocket.readyState === 1;
+}
+
+/** Fail every in-flight request instead of making each one sit out its timeout. */
+function drainPending(message) {
+  for (const [id, p] of pending) {
+    pending.delete(id);
+    clearTimeout(p.timer);
+    p.reject({ message, code: "EXTENSION_DISCONNECTED" });
+  }
+}
+
 // ─── WebSocket Server (for extension) ───────────────────────────────
 
+// Whoever holds this socket answers every request the bridge forwards, so it is
+// a stronger position than calling the HTTP API. Web pages are refused by origin;
+// a local process sends no Origin at all, so the slot is first-come: a live
+// extension cannot be displaced by a later client. The heartbeat below evicts a
+// socket that dies without closing, so a dead holder cannot lock the slot.
 const wss = new WebSocketServer({
   host: "127.0.0.1",
   port: WS_PORT,
-  verifyClient: ({ req }) => {
+  verifyClient: ({ req }, done) => {
     if (isWebPageOrigin(req.headers.origin)) {
       console.error(`[bridge] Rejected WebSocket connection from web origin ${req.headers.origin}`);
-      return false;
+      return done(false, 403, "Forbidden");
     }
-    return true;
+    if (slotHeld()) {
+      console.warn("[bridge] Rejected WebSocket connection: extension slot already held");
+      return done(false, 409, "Extension slot already held");
+    }
+    done(true);
   },
 });
 
 wss.on("connection", (ws) => {
+  // Two handshakes can pass verifyClient at once; this is the authoritative check.
+  if (slotHeld()) {
+    console.warn("[bridge] Closing second WebSocket client: extension slot already held");
+    ws.close(1013, "Extension slot already held");
+    return;
+  }
   console.log("[bridge] Extension connected");
   extensionSocket = ws;
   ws.isAlive = true;
@@ -156,8 +188,10 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
+    if (extensionSocket !== ws) return;
     console.log("[bridge] Extension disconnected");
-    if (extensionSocket === ws) extensionSocket = null;
+    extensionSocket = null;
+    drainPending("Thunderbird extension disconnected while the request was in flight");
   });
 });
 
@@ -182,14 +216,17 @@ wss.on("close", () => {
 
 function forwardToExtension(method, path, body, timeoutMs = DEFAULT_TIMEOUT) {
   return new Promise((resolve, reject) => {
-    if (!extensionSocket || extensionSocket.readyState !== 1) {
-      reject({ message: "Thunderbird extension not connected. Is Thunderbird running?" });
+    if (!slotHeld()) {
+      reject({
+        message: "Thunderbird extension not connected. Is Thunderbird running?",
+        code: "EXTENSION_DISCONNECTED",
+      });
       return;
     }
     const id = randomUUID();
     const timer = setTimeout(() => {
       pending.delete(id);
-      reject({ message: `Request timed out (${Math.round(timeoutMs / 1000)}s)` });
+      reject({ message: `Request timed out (${Math.round(timeoutMs / 1000)}s)`, code: "TIMEOUT" });
     }, timeoutMs);
     pending.set(id, { resolve, reject, timer });
     extensionSocket.send(JSON.stringify({ id, method, path, body }));
@@ -263,8 +300,22 @@ const httpServer = createServer(async (req, res) => {
   }
 
   // Read body
+  // Capped: an unbounded read lets any local caller grow the heap until the daemon dies.
   let body = "";
-  for await (const chunk of req) body += chunk;
+  let received = 0;
+  for await (const chunk of req) {
+    received += chunk.length;
+    if (received > MAX_BODY_BYTES) {
+      // Answer first, then drop the connection; destroying it up front truncates the reply.
+      res.writeHead(413, { Connection: "close" });
+      res.end(
+        JSON.stringify({ error: `Request body exceeds ${MAX_BODY_BYTES} bytes`, code: "INVALID_ARGS" }),
+        () => req.socket?.destroy()
+      );
+      return;
+    }
+    body += chunk;
+  }
 
   let parsedBody = null;
   if (body.trim()) {
@@ -282,7 +333,8 @@ const httpServer = createServer(async (req, res) => {
   const headerTimeout = req.headers["x-tb-timeout"];
   if (headerTimeout) {
     const parsed = parseInt(headerTimeout);
-    if (parsed > 0) timeoutMs = parsed;
+    // Clamped: an unbounded value pins a pending entry and its socket indefinitely.
+    if (parsed > 0) timeoutMs = Math.min(parsed, MAX_TIMEOUT);
   }
 
   // Forward to extension
@@ -291,9 +343,10 @@ const httpServer = createServer(async (req, res) => {
     res.writeHead(200);
     res.end(JSON.stringify(result));
   } catch (err) {
-    const status = err.message?.includes("not connected") ? 503 : 500;
+    // Status from an explicit code: matching on message text breaks when the wording changes.
+    const status = err.code === "EXTENSION_DISCONNECTED" ? 503 : err.code === "TIMEOUT" ? 504 : 500;
     res.writeHead(status);
-    res.end(JSON.stringify({ error: err.message || "Unknown error" }));
+    res.end(JSON.stringify({ error: err.message || "Unknown error", code: err.code || "THUNDERBIRD_ERROR" }));
   }
 });
 
