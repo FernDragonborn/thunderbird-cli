@@ -174,6 +174,54 @@ await withBridge({}, async () => {
   legit.ws.close();
 });
 
+// ─── WebSocket: one client per slot ─────────────────────────────────
+
+console.log("\n\x1b[1mExtension slot\x1b[0m");
+await withBridge({}, async () => {
+  const held = await connectExtension({ origin: "moz-extension://real-addon" });
+  test("first client takes the slot", held.state, "open");
+
+  // A local process sends no Origin, so origin checks cannot stop it; last-writer-wins
+  // would hand it every later request.
+  const intruder = await connectExtension();
+  test("a second client cannot displace it", intruder.state, "rejected");
+  const routed = await http("POST", "/messages/search", { body: "{}" });
+  test("requests still go to the first client", routed.json?.echoed, "/messages/search");
+  test("the intruder received nothing", intruder.received.length, 0);
+
+  // A holder dropping mid-flight fails the request now, not after the full timeout.
+  held.ws.removeAllListeners("message");
+  const started = Date.now();
+  const inflight = http("POST", "/messages/search", { body: "{}" });
+  await sleep(150);
+  held.ws.close();
+  const dropped = await inflight;
+  test("in-flight request fails when the holder drops", dropped.status, 503);
+  test("the failure carries EXTENSION_DISCONNECTED", dropped.json?.code, "EXTENSION_DISCONNECTED");
+  test("it fails fast", Date.now() - started < 5000, true);
+
+  await sleep(100);
+  const rejoin = await connectExtension({ origin: "moz-extension://real-addon" });
+  test("the slot is reusable once released", rejoin.state, "open");
+  rejoin.ws.close();
+});
+
+// ─── HTTP: resource limits ──────────────────────────────────────────
+
+console.log("\n\x1b[1mResource limits\x1b[0m");
+await withBridge({ TB_BRIDGE_MAX_BODY: "1024" }, async () => {
+  const huge = await new Promise((resolve) => {
+    const req = request({ host: "127.0.0.1", port: PORT, method: "POST", path: "/messages/search" }, (res) => {
+      res.resume();
+      res.on("end", () => resolve(res.statusCode));
+    });
+    // The bridge answers 413 and then drops the socket, so the upload side may error.
+    req.on("error", () => {});
+    req.end("x".repeat(64 * 1024));
+  });
+  test("oversized request body → 413", huge, 413);
+});
+
 // ─── WebSocket heartbeat ────────────────────────────────────────────
 
 console.log("\n\x1b[1mHeartbeat\x1b[0m");
